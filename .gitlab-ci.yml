@@ -40,7 +40,7 @@ build_backend_image_stg:
   tags:
     - $RUNNER_TAG
   script:
-    - docker build -f cmd/backend/Dockerfile --build-arg version=$ENV_NAME -t $CI_REGISTRY_IMAGE:$ENV_NAME .
+    - docker build -t $CI_REGISTRY_IMAGE:$ENV_NAME .
     - docker push $CI_REGISTRY_IMAGE:$ENV_NAME
   only:
     - /^staging/ # Build only for branches matching this regex pattern
