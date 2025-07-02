@@ -1,0 +1,72 @@
+image: docker:20-dind
+
+services:
+  - name: docker:20-dind
+    command: ['--tls=false']
+
+variables:
+  DOCKER_DRIVER: overlay
+  DOCKER_TLS_CERTDIR: ''
+  RUNNER_TAG: 'uranus-01'
+
+stages:
+  # - show-env
+  # - build-staging
+  - build_backend_image_stg
+  - build_backend_image_uat
+  - build_backend_image_prd
+
+before_script:
+  - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  - |
+    case "$CI_COMMIT_REF_NAME" in
+      "uat")
+        export ENV_NAME="uat"
+        export ENV_VARIABLE=$ENV_UAT
+        ;;
+      "staging")
+        export ENV_NAME="staging"
+        export ENV_VARIABLE=$ENV_STAGING
+        ;;
+      *)
+        export ENV_NAME=$(echo $CI_COMMIT_REF_NAME | tr '[:upper:]' '[:lower:]')
+        export ENV_VARIABLE=""
+        ;;
+    esac
+
+# ============================= backend service ================================
+build_backend_image_stg:
+  stage: build_backend_image_stg
+  tags:
+    - $RUNNER_TAG
+  script:
+    - docker build -t $CI_REGISTRY_IMAGE:$ENV_NAME .
+    - docker push $CI_REGISTRY_IMAGE:$ENV_NAME
+  only:
+    - /^staging/ # Build only for branches matching this regex pattern
+
+build_backend_image_uat:
+  stage: build_backend_image_uat
+  tags:
+    - $RUNNER_TAG
+  script:
+    - docker pull $CI_REGISTRY_IMAGE:staging
+    - docker tag $CI_REGISTRY_IMAGE:staging $CI_REGISTRY_IMAGE:$ENV_NAME
+    - docker push $CI_REGISTRY_IMAGE:$ENV_NAME
+  only:
+    - /^uat/ # Build only for branches matching this regex pattern
+
+build_backend_image_prd:
+  stage: build_backend_image_prd
+  script:
+    - docker pull $CI_REGISTRY_IMAGE:uat
+    - docker tag $CI_REGISTRY_IMAGE:uat $CI_REGISTRY_IMAGE:$ENV_NAME
+    - docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_TAG
+  tags:
+    - $RUNNER_TAG
+  only:
+    # - tags
+    - /^([0-9]+\.){2}[0-9]+$/
+  except:
+    - master
+
