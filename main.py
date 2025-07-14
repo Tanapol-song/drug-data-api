@@ -130,6 +130,7 @@ class AllergyResponse(BaseModel):
     data_allergy: PageResponse[AllergyItem]
 
 # ── 3) CYPHER TEMPLATES (เหมือนเดิม) ───────────────────────────
+# ── 3) CYPHER TEMPLATES (เหมือนเดิม) ───────────────────────────
 DRUGSEARCH_CYPHER = """
 UNWIND $qs AS q
 WITH q WHERE trim(q) <> ""
@@ -160,8 +161,6 @@ WITH q,
      })[0] AS best
 RETURN q AS code, best
 """
-
-
 
 RESOLVE_SUBS_FALLBACK = """
 UNWIND $codes AS code
@@ -195,7 +194,6 @@ RETURN
   COALESCE(r.DISCUSSION,"")      AS discussion,
   COALESCE(r.REFERENCE,"")       AS reference
 """
-
 
 # ── 4) HELPERS ──────────────────────────────────────────────────
 
@@ -344,7 +342,7 @@ def fallback_resolve_subs(tx, codes: List[str]) -> List[str]:
 
 def enrich_items(items: List[DrugItem], detail_map: Dict[str, dict]) -> Dict[str, DrugItem]:
     """
-    • เติม code / name ทุก level ให้ครบที่สุด
+    • เติม code / name ทุก level ให้ครบที่สุด (and override any bad user input)
     • คืน mapping  SUBS-id → DrugItem  สำหรับใช้ประกอบผลลัพธ์
     """
     mapping: Dict[str, DrugItem] = {}
@@ -353,20 +351,24 @@ def enrich_items(items: List[DrugItem], detail_map: Dict[str, dict]) -> Dict[str
     with driver.session() as sess:
         for it in items:
             matched = False
-            # --- ❶ loop code ทุกตัวที่มี ไม่สนว่า it.name ว่างหรือไม่ ---
+
+            # ── ❶ Loop through every code the user provided (TPU/TP/GPU/GP/VTM/SUBS)
             for code in codes_from_item(it):
                 d = detail_map.get(code)
                 if not d:
                     continue
                 matched = True
 
-                # --- ❷ เติม code / name ครบทั้ง 5 level (TPU..VTM) ---
+                # ── ❷ **Always override** with the canonical code/name from detail_map
                 for lv in LEVELS:
-                    if not getattr(it, CODE_FIELD[lv]) and d.get(DETAIL_CODE[lv]):
-                        setattr(it, CODE_FIELD[lv], d[DETAIL_CODE[lv]])
-                    if not getattr(it, NAME_FIELD[lv]) and d.get(DETAIL_NAME[lv]):
-                        setattr(it, NAME_FIELD[lv], d[DETAIL_NAME[lv]])
-
+                    # e.g. DETAIL_CODE["tpu"] == "tpu_code"
+                    correct_code = d.get(DETAIL_CODE[lv])
+                    if correct_code:
+                        setattr(it, CODE_FIELD[lv], correct_code)
+                    correct_name = d.get(DETAIL_NAME[lv])
+                    if correct_name:
+                        setattr(it, NAME_FIELD[lv], correct_name)
+                        
                 # map SUBS → DrugItem
                 for sid in d["subs_codes"]:
                     mapping.setdefault(sid, it)
@@ -444,13 +446,17 @@ def get_interactions(
     history_map = enrich_items(payload.drug_histories, detail_map)
 
     # 4) Origin map
-    subs_origin = {sid: "currents" for sid in current_map}
-    subs_origin.update({sid: "histories" for sid in history_map})
+    subs_origin = { sid: "currents"  for sid in current_map.keys() }
+    subs_origin.update({ sid: "histories" for sid in history_map.keys() })
     
-    # 5) Build contrast pairs
-    pairs_cc = [(a,b,0) for a,b in combinations(sorted(curr_codes),2)]
-    pairs_ch = [(a,b,1) for a,b in product(sorted(curr_codes),sorted(hist_codes)) if a!=b]
-    pairs_hh = [(a,b,2) for a,b in combinations(sorted(hist_codes),2)]
+    # 5) Build contrast 
+    subs_curr = sorted(current_map.keys())
+    subs_hist = sorted(history_map.keys())
+    
+    pairs_cc = [(a, b, 0) for a, b in combinations(subs_curr, 2)]
+    pairs_ch = [(a, b, 1) for a, b in product(subs_curr, subs_hist) if a != b]
+    pairs_hh = [(a, b, 2) for a, b in combinations(subs_hist, 2)]
+    
     print(f"[LOG] current count:           {len(curr_codes)}")
     print(f"[LOG] history count:           {len(hist_codes)}")
     print(f"[LOG] current × history pairs: {len(pairs_ch)}")
