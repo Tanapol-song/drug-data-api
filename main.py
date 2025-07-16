@@ -7,9 +7,10 @@ from collections import Counter
 import re
 from fastapi import FastAPI, Query
 from pydantic import BaseModel, Field
-from neo4j import GraphDatabase, basic_auth
+from neo4j import basic_auth, AsyncGraphDatabase
 from dotenv import load_dotenv
-
+from collections import Counter
+import asyncio
 
 load_dotenv("api.env")
 
@@ -19,7 +20,12 @@ NEO4J_USER = os.getenv("NEO4J_USERNAME_STAGING")
 NEO4J_PASS = os.getenv("NEO4J_PASSWORD_STAGING")
 
 
-driver = GraphDatabase.driver(NEO4J_URI, auth=basic_auth(NEO4J_USER, NEO4J_PASS), max_connection_pool_size=20)
+driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=basic_auth(NEO4J_USER, NEO4J_PASS), max_connection_pool_size=20)
+
+# # 1) Create an async driver alongside your sync one
+# async_driver = AsyncGraphDatabase.driver(
+#     NEO4J_URI, auth=basic_auth(NEO4J_USER, NEO4J_PASS)
+# )
 
 app = FastAPI(title="Drug Interaction API", version="1.1.1")
 
@@ -127,9 +133,8 @@ class AllergyResponse(BaseModel):
     status:       bool
     code:         int
     message:      str
-    data_allergy: PageResponse[AllergyItem]
+    data: PageResponse[AllergyItem]
 
-# ── 3) CYPHER TEMPLATES (เหมือนเดิม) ───────────────────────────
 # ── 3) CYPHER TEMPLATES (เหมือนเดิม) ───────────────────────────
 DRUGSEARCH_CYPHER = """
 UNWIND $qs AS q
@@ -205,75 +210,39 @@ DETAIL_NAME  = NAME_FIELD
 CODE   = {lv: f"{lv}_code" for lv in LEVELS}
 NAME   = {lv: f"{lv}_name" for lv in LEVELS}
 
-
-# def normalize_query(text: str) -> str:
-#     """เตรียม string ให้เหมาะกับ full-text search
-#        - เปลี่ยน / เป็น เว้นวรรค
-#        - ใส่ช่องว่างก่อนหน่วย (mg, mL, g, mcg) เผื่อไม่มี space
-#     """
-#     if not text:
-#         return text
-#     text = re.sub(r'/', ' ', text)
-#     text = re.sub(r'(\d)(mg|mL|mcg|g)', r'\1 \2', text, flags=re.I)
-#     return ' '.join(text.split())      # เก็บ space เดียว
-
-def normalize_query(text):
+# ── 5) UTILITY FUNCTIONS ────────────────────────────────────────
+async def normalize_query(text: str) -> str:
     if text:
-        # เอาเฉพาะ a-z, A-Z, 0-9 และช่องว่าง
         cleaned_text = re.sub(r'[^a-zA-Z0-9\s]', '', text)
-        # ถ้าอยากตัดช่องว่างซ้ำให้เหลือช่องว่างเดียว
         cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
         return cleaned_text
     return text
 
-def highest_idx(it: DrugItem) -> int:
+async def highest_idx(it: DrugItem) -> int:
     for i, lv in enumerate(LEVELS):
         if getattr(it, CODE[lv]):
             return i
-    return len(LEVELS)  # ไม่มี code เลย (SUBS เท่านั้น)
+    return len(LEVELS)
 
-def codes_from_item(it: DrugItem) -> List[str]:
+async def codes_from_item(it: DrugItem) -> List[str]:
     return [c for c in [
         it.tpu_code, it.tp_code, it.gpu_code,
         it.gp_code, it.vtm_code, it.subs_code
     ] if c]
 
-# def resolve_subs_from_name(tx, names: List[str]) -> Dict[str, str]:
-#     rows = tx.run(DRUGSEARCH_CYPHER, {"qs": names})
-#     name_to_subs: Dict[str, List[str]] = {}
-#     for r in rows:
-#         q = r["code"]
-#         best = r["best"]
-#         if best is None:
-#             continue
-#         subs_codes = best["subs_codes"] or []
-#         if isinstance(subs_codes, str):
-#             try:
-#                 subs_codes = ast.literal_eval(subs_codes)
-#             except Exception:
-#                 subs_codes = []
-#         name_to_subs.setdefault(q, []).extend(subs_codes)
 
-#     # pick most common subs per name
-#     final_map: Dict[str, str] = {}
-#     for name, subs_list in name_to_subs.items():
-#         if not subs_list:
-#             continue
-#         counts = Counter(subs_list)
-#         most_common = counts.most_common(1)[0][0]
-#         final_map[name] = most_common
-#     return final_map
-def resolve_subs_from_name(tx, names: List[str]) -> Dict[str, str]:
-    rows = tx.run(DRUGSEARCH_CYPHER, {"qs": names})
+# ─── Neo4j Async Queries ────────────────────────
+async def resolve_subs_from_name(tx, names: List[str]) -> Dict[str, str]:
+    result = await tx.run(DRUGSEARCH_CYPHER, {"qs": names})
     name_to_subs: Dict[str, List[str]] = {}
     unresolved = set(names)
 
-    for r in rows:
+    async for r in result:
         q = r["code"]
         best = r["best"]
         if best is None:
             continue
-        subs_codes = best["subs_codes"] or []
+        subs_codes = best.get("subs_codes") or []
         if isinstance(subs_codes, str):
             try:
                 subs_codes = ast.literal_eval(subs_codes)
@@ -283,15 +252,14 @@ def resolve_subs_from_name(tx, names: List[str]) -> Dict[str, str]:
             name_to_subs.setdefault(q, []).extend(subs_codes)
             unresolved.discard(q)
 
-    # fallback fulltext no-record match if not resolved
     if unresolved:
-        fallback_rows = tx.run(DRUGSEARCH_CYPHER, {"qs": list(unresolved)})
-        for r in fallback_rows:
+        fallback = await tx.run(DRUGSEARCH_CYPHER, {"qs": list(unresolved)})
+        async for r in fallback:
             q = r["code"]
             best = r["best"]
             if best is None:
                 continue
-            subs_codes = best["subs_codes"] or []
+            subs_codes = best.get("subs_codes") or []
             if isinstance(subs_codes, str):
                 try:
                     subs_codes = ast.literal_eval(subs_codes)
@@ -300,7 +268,6 @@ def resolve_subs_from_name(tx, names: List[str]) -> Dict[str, str]:
             if subs_codes:
                 name_to_subs.setdefault(q, []).extend(subs_codes)
 
-    # pick most common subs per name
     final_map: Dict[str, str] = {}
     for name, subs_list in name_to_subs.items():
         if not subs_list:
@@ -310,16 +277,19 @@ def resolve_subs_from_name(tx, names: List[str]) -> Dict[str, str]:
         final_map[name] = most_common
     return final_map
 
-def query_drug_details(tx, codes: List[str]) -> Dict[str, dict]:
-    rows = tx.run(DRUGSEARCH_CYPHER, {"qs": codes})
+async def query_drug_details(tx, codes: List[str]) -> Dict[str, dict]:
+    rows = await tx.run(DRUGSEARCH_CYPHER, {"qs": codes})
     out: Dict[str, dict] = {}
-    for r in rows:
+    found_codes = set()
+
+    async for r in rows:
         best = r["best"]
         if best is None:
             continue
-        # แปลง SUBS list ถ้าเก็บเป็นสตริง
+
         subs_codes = best["subs_codes"] or []
         subs_names = best["subs_names"] or []
+
         if isinstance(subs_codes, str):
             try:
                 subs_codes = ast.literal_eval(subs_codes)
@@ -330,75 +300,89 @@ def query_drug_details(tx, codes: List[str]) -> Dict[str, dict]:
                 subs_names = ast.literal_eval(subs_names)
             except Exception:
                 subs_names = []
+
         best["subs_codes"] = subs_codes
         best["subs_names"] = subs_names
         out[r["code"]] = best
+        found_codes.add(r["code"])
+
+    # 🔁 fallback: resolve SUBS by code match directly
+    missing_codes = [code for code in codes if code not in found_codes]
+    if missing_codes:
+        print(f"[LOG] Fallback resolving for: {missing_codes}")
+        fallback_rows = await tx.run(RESOLVE_SUBS_FALLBACK, {"codes": missing_codes})
+        async for r in fallback_rows:
+            sid = r.get("sid")
+            if sid:
+                out[sid] = {
+                    "subs_codes": [sid],
+                    "subs_names": [],
+                    "tpu_code": "", "tp_code": "", "gpu_code": "",
+                    "gp_code": "", "vtm_code": "",
+                    "tpu_name": "", "tp_name": "", "gpu_name": "",
+                    "gp_name": "", "vtm_name": ""
+                }
+
     return out
 
+# async def fallback_resolve_subs(tx, codes: List[str]) -> List[str]:
+#     return [r["sid"] for r in tx.run(RESOLVE_SUBS_FALLBACK, {"codes": codes})]
 
-def fallback_resolve_subs(tx, codes: List[str]) -> List[str]:
-    return [r["sid"] for r in tx.run(RESOLVE_SUBS_FALLBACK, {"codes": codes})]
+async def fallback_resolve_subs(tx, codes: List[str]) -> List[str]:
+    result = await tx.run(RESOLVE_SUBS_FALLBACK, {"codes": codes})
+    return [r["sid"] async for r in result]
 
-
-def enrich_items(items: List[DrugItem], detail_map: Dict[str, dict]) -> Dict[str, DrugItem]:
-    """
-    • เติม code / name ทุก level ให้ครบที่สุด (and override any bad user input)
-    • คืน mapping  SUBS-id → DrugItem  สำหรับใช้ประกอบผลลัพธ์
-    """
-    mapping: Dict[str, DrugItem] = {}
+# ─── Enrichment ────────────────────────────────
+async def enrich_items(driver, items: List[DrugItem], detail_map: Dict[str, dict]) -> Dict[str, List[DrugItem]]:
+    mapping: Dict[str, List[DrugItem]] = {}
     codes_fallback: List[str] = []
 
-    with driver.session() as sess:
+    async with driver.session() as session:
         for it in items:
             matched = False
 
-            # ── ❶ Loop through every code the user provided (TPU/TP/GPU/GP/VTM/SUBS)
-            for code in codes_from_item(it):
+            codes = await codes_from_item(it)  # ✅ await ก่อน
+            for code in codes:
                 d = detail_map.get(code)
                 if not d:
                     continue
                 matched = True
 
-                # ── ❷ **Always override** with the canonical code/name from detail_map
                 for lv in LEVELS:
-                    # e.g. DETAIL_CODE["tpu"] == "tpu_code"
                     correct_code = d.get(DETAIL_CODE[lv])
                     if correct_code:
                         setattr(it, CODE_FIELD[lv], correct_code)
                     correct_name = d.get(DETAIL_NAME[lv])
                     if correct_name:
                         setattr(it, NAME_FIELD[lv], correct_name)
-                        
-                # map SUBS → DrugItem
+
                 for sid in d["subs_codes"]:
-                    mapping.setdefault(sid, it)
+                    mapping.setdefault(sid, []).append(it)
 
-            # --- ❸ ถ้าไม่ match เลยเก็บไว้ fallback หา SUBS ---
             if not matched:
-                codes_fallback.extend(codes_from_item(it))
+                codes = await codes_from_item(it)  # ✅ ต้อง await อีกครั้ง
+                codes_fallback.extend(codes)
 
-        # -- Fallback SUBS mapping (เหมือนเดิม) --
         if codes_fallback:
-            subs_ids = sess.read_transaction(fallback_resolve_subs, codes_fallback)
+            subs_ids = await session.execute_read(fallback_resolve_subs, codes_fallback)
             for sid in subs_ids:
-                mapping.setdefault(sid, items[0])
+                mapping.setdefault(sid, []).append(items[0])  # หรือจะกระจายทั้งหมดก็ได้
 
     return mapping
 
+# ─── Utilities ────────────────────────────────
 def choose_input_contrast(sid1: str, sid2: str, group1: str, group2: str):
     if group1 == "currents" and group2 != "currents":
         return sid1, sid2
     if group2 == "currents" and group1 != "currents":
         return sid2, sid1
-    # กรณีที่กลุ่มเท่ากัน → เอา sid ที่มีเลขน้อยกว่าเป็น input
     try:
         return (sid1, sid2) if int(sid1) < int(sid2) else (sid2, sid1)
     except ValueError:
         return (sid1, sid2) if sid1 < sid2 else (sid2, sid1)
 
-
-def fill_codes(prefix: str, it: DrugItem) -> Dict[str, str]:
-    top = highest_idx(it)
+async def fill_codes(prefix: str, it: DrugItem) -> Dict[str, str]:
+    top = await highest_idx(it)
     out = {}
     for i, lv in enumerate(LEVELS):
         out[f"{prefix}_{lv}_code"] = getattr(it, CODE_FIELD[lv]) if i >= top else ""
@@ -411,122 +395,138 @@ def fill_codes(prefix: str, it: DrugItem) -> Dict[str, str]:
     response_model=DrugsResponse,
     summary="Get drug interaction contrasts"
 )
-def get_interactions(
+async def get_interactions(
     payload: DrugPayload,
     page: int = Query(1, ge=1, description="Page number, default=1"),
     row:  int = Query(10, ge=1, description="Items per page, default=10"),
 ):
-    # 1) Name resolution for histories only
     names_to_resolve = []
     for it in payload.drug_histories:
-        if not any(codes_from_item(it)) and it.name:
-            it.name = normalize_query(it.name)
-            names_to_resolve.append(it.name)
-    print(f"[LOG] names to resolve:       {names_to_resolve}")
+        if not any(await codes_from_item(it)):
+            search_name = it.name or it.tpu_name or it.tp_name or it.gpu_name or it.gp_name or it.vtm_name
+            if search_name:
+                search_name = await normalize_query(search_name)
+                print(f"[LOG] Resolving name: {search_name}")
+                names_to_resolve.append(search_name)
+                it.name = search_name
+
+    print(f"[LOG] names to resolve: {names_to_resolve}")
 
     if names_to_resolve:
-        with driver.session() as s:
-            name_to_subs = s.read_transaction(resolve_subs_from_name, names_to_resolve)
-        print(f"[LOG] resolved names to subs:  {name_to_subs}")
+        async with driver.session() as s:
+            name_to_subs = await s.execute_read(resolve_subs_from_name, names_to_resolve)
+        print(f"[LOG] resolved names to subs: {name_to_subs}")
         for it in payload.drug_histories:
             if it.name in name_to_subs:
                 it.subs_code = name_to_subs[it.name]
 
-    # 2) Build code‐sets from currents + histories
-    curr_codes = {c for it in payload.drug_currents  for c in codes_from_item(it)}
-    hist_codes = {c for it in payload.drug_histories for c in codes_from_item(it)}
-    print(f"[LOG] raw currents codes:    {sorted(curr_codes)}")
-    print(f"[LOG] raw histories codes:    {sorted(hist_codes)}")
+    curr_codes = set()
+    for it in payload.drug_currents:
+        codes = await codes_from_item(it)
+        curr_codes.update(codes)
 
-    # 3) Query & enrich
+    hist_codes = set()
+    for it in payload.drug_histories:
+        codes = await codes_from_item(it)
+        hist_codes.update(codes)
+
+    print(f"[LOG] raw currents codes:  {sorted(curr_codes)}")
+    print(f"[LOG] raw histories codes: {sorted(hist_codes)}")
+
     all_codes = curr_codes | hist_codes
-    with driver.session() as s:
-        detail_map = s.read_transaction(query_drug_details, list(all_codes))
-    current_map = enrich_items(payload.drug_currents,  detail_map)
-    history_map = enrich_items(payload.drug_histories, detail_map)
+    async with driver.session() as s:
+        detail_map = await s.execute_read(query_drug_details, list(all_codes))
 
-    # 4) Origin map
-    subs_origin = { sid: "currents"  for sid in current_map.keys() }
-    subs_origin.update({ sid: "histories" for sid in history_map.keys() })
-    
-    # 5) Build contrast 
-    subs_curr = sorted(current_map.keys())
-    subs_hist = sorted(history_map.keys())
-    
-    pairs_cc = [(a, b, 0) for a, b in combinations(subs_curr, 2)]
-    pairs_ch = [(a, b, 1) for a, b in product(subs_curr, subs_hist) if a != b]
-    pairs_hh = [(a, b, 2) for a, b in combinations(subs_hist, 2)]
-    
-    print(f"[LOG] current count:           {len(curr_codes)}")
-    print(f"[LOG] history count:           {len(hist_codes)}")
-    print(f"[LOG] current × history pairs: {len(pairs_ch)}")
+    current_map = await enrich_items(driver, payload.drug_currents, detail_map)
+    history_map = await enrich_items(driver, payload.drug_histories, detail_map)
 
-    # 6) Query each batch
-    contrast_data = []
-    with driver.session() as s:
-        for batch in (pairs_cc, pairs_ch, pairs_hh):
-            rows = s.run(CONTRAST_CYPHER, {"pairs":[ [x,y] for x,y,_ in batch ]})
-            for rec, (_,_,ctype) in zip(rows, batch):
-                d = rec.data()
-                d["contrast_type"] = ctype
-                contrast_data.append(d)
+    subs_to_items: Dict[str, List[DrugItem]] = {}
+    for group in (payload.drug_currents, payload.drug_histories):
+        for it in group:
+            codes = await codes_from_item(it)
+            for code in codes:
+                d = detail_map.get(code)
+                if d and d.get("subs_codes"):
+                    for sid in d["subs_codes"]:
+                        subs_to_items.setdefault(sid, []).append(it)
+                    break
 
-    # 7) Build response rows
-    rows = []
-    for rec in contrast_data:
-        sid1, sid2 = rec["sub1_id"], rec["sub2_id"]
-        grp1, grp2 = subs_origin[sid1], subs_origin[sid2]
-        in_id, ct_id = choose_input_contrast(sid1,sid2,grp1,grp2)
-        in_item = current_map.get(in_id) or history_map.get(in_id)
-        ct_item = current_map.get(ct_id) or history_map.get(ct_id)
-        in_name = rec["sub1_name"] if in_id==rec["sub1_id"] else rec["sub2_name"]
-        ct_name = rec["sub2_name"] if in_id==rec["sub1_id"] else rec["sub1_name"]
+    unique_sids = sorted(subs_to_items.keys())
+    jobs = []
+    for sid1, sid2 in combinations(unique_sids, 2):
+        items1, items2 = subs_to_items[sid1], subs_to_items[sid2]
+        for in_item in items1:
+            for ct_item in items2:
+                jobs.append({"pair": [sid1, sid2], "in_item": in_item, "ct_item": ct_item})
 
+    print(f"[LOG] jobs count: {len(jobs)} pairs: {[j['pair'] for j in jobs]}")
+
+    unique_pairs = []
+    seen = set()
+    for j in jobs:
+        p = tuple(j["pair"])
+        if p not in seen:
+            seen.add(p)
+            unique_pairs.append(p)
+
+    async with driver.session() as sess:
+        result = await sess.run(CONTRAST_CYPHER, {"pairs": [list(p) for p in unique_pairs]})
+        records = [r async for r in result]
+
+    pair_to_data = {}
+    for rec in records:
+        d = rec.data()
+        pair_to_data[(d["sub1_id"], d["sub2_id"])] = d
+
+    rows: List[ContrastItem] = []
+    for job in jobs:
+        sid1, sid2 = job["pair"]
+        d = pair_to_data.get((sid1, sid2)) or pair_to_data.get((sid2, sid1))
+        if not d:
+            continue
         rows.append(ContrastItem(
             ref_id=str(uuid.uuid4()),
-            **fill_codes("input",in_item),
-            **fill_codes("contrast",ct_item),
-            contrast_type=rec["contrast_type"],
-            interaction_detail_en=rec["interaction_detail_en"],
-            interaction_detail_th=rec["interaction_detail_th"],
-            onset=rec["onset"],
-            severity=rec["severity"],
-            documentation=rec["documentation"],
-            significance=rec["significance"],
-            management=rec["management"],
-            discussion=rec["discussion"],
-            reference=rec["reference"],
-            input_substances=[{"code":in_id,"name":in_name}],
-            contrast_substances=[{"code":ct_id,"name":ct_name}],
-        ) )
+            **await fill_codes("input", job["in_item"]),
+            **await fill_codes("contrast", job["ct_item"]),
+            interaction_detail_en=d["interaction_detail_en"],
+            interaction_detail_th=d["interaction_detail_th"],
+            onset=d["onset"],
+            severity=d["severity"],
+            documentation=d["documentation"],
+            significance=d["significance"],
+            management=d["management"],
+            discussion=d["discussion"],
+            reference=d["reference"],
+            input_substances=[{"code": d["sub1_id"], "name": d["sub1_name"]}],
+            contrast_substances=[{"code": d["sub2_id"], "name": d["sub2_name"]}],
+            contrast_type=0
+        ))
+
     total = len(rows)
     start = (page - 1) * row
-    end   = start + row
+    end = start + row
     page_rs = rows[start:end]
-    
+
     return DrugsResponse(
         status=True,
         code=200,
         message="get success",
         data=PageResponse(
             pagination=Pagination(page=page, row=len(page_rs), total=total),
-            data= page_rs
+            data=page_rs
         )
     )
 
-# ── 6) /api/v1/allergy ────────────────────────────────────────────
-@app.post(
-    "/api/v1/allergy",
-    response_model=AllergyResponse,
-    summary="Get allergy summary"
-)
-def get_allergy(
+
+# ── 6) /api/v1/allergy ────────────────────────────────────────────────────
+@app.post("/api/v1/allergy", response_model=AllergyResponse, summary="Get allergy summary")
+async def get_allergy(
     payload: AllergyPayload,
-    page:     int = Query(1, ge=1, description="Page number"),
-    row:      int = Query(10, ge=1, description="Items per page"),
+    page: int = Query(1, ge=1, description="Page number"),
+    row: int = Query(10, ge=1, description="Items per page"),
 ):
-    # 0) Cypher to resolve any level code up to all SUBS ancestors
-    SEARCHSUBS_CYPHER = """
+    # Cypher query for resolving subs
+    SEARCHSUBS_CYPHER = """ 
 UNWIND $codes AS code
 MATCH (n)
   WHERE (n:TPU  AND n.`TMTID(TPU)`  = code)
@@ -538,11 +538,12 @@ MATCH (n)
 OPTIONAL MATCH (n)<-[:TP_TO_TPU|GPU_TO_TPU|GP_TO_TP|GP_TO_GPU|VTM_TO_GP|SUBS_TO_VTM*0..5]-(subs:SUBS)
 WITH code, collect(DISTINCT COALESCE(subs.`TMTID(SUBS)`, n.`TMTID(SUBS)`)) AS subs_ids
 RETURN code AS raw_code, subs_ids
-"""
+    """
 
-    def resolve_to_subs(tx, codes: List[str]) -> Dict[str, List[str]]:
+    async def resolve_to_subs(tx, codes: List[str]) -> Dict[str, List[str]]:
         mapping: Dict[str, List[str]] = {}
-        for record in tx.run(SEARCHSUBS_CYPHER, {"codes": codes}):
+        result = await tx.run(SEARCHSUBS_CYPHER, {"codes": codes})
+        async for record in result:
             raw = record["raw_code"]
             subs_list = [s for s in record["subs_ids"] if s is not None]
             mapping[raw] = subs_list
@@ -550,91 +551,118 @@ RETURN code AS raw_code, subs_ids
             mapping.setdefault(c, [])
         return mapping
 
-    # 1) Resolve names → subs_code on history & allergy items
+    # Cache codes_from_item
+    item_code_cache = {}
+
+    async def get_cached_codes(it):
+        key = id(it)
+        if key not in item_code_cache:
+            item_code_cache[key] = await codes_from_item(it)
+        return item_code_cache[key]
+
+    # Normalize and resolve names
+    # names_to_resolve = []
+    # for it in payload.drug_histories + payload.drug_allergies:
+    #     if not any(await get_cached_codes(it)) and it.name:
+    #         it.name = await normalize_query(it.name)
+    #         names_to_resolve.append(it.name)
+    
+    # Step 1: เตรียมชื่อที่ยังไม่มี code เพื่อนำไป resolve
     names_to_resolve = []
     for it in payload.drug_histories + payload.drug_allergies:
-        if not any(codes_from_item(it)) and it.name:
-            it.name = normalize_query(it.name)
+        if not any(await get_cached_codes(it)) and it.name:
+            it.name = await normalize_query(it.name)
             names_to_resolve.append(it.name)
-    print(f"[LOG] names to resolve:       {names_to_resolve}")
 
+    print(f"[LOG] names to resolve: {names_to_resolve}")
+
+    # Step 2: resolve subs จากชื่อ
+    name_to_subs = {}
     if names_to_resolve:
-        with driver.session() as s:
-            name_to_subs = s.read_transaction(resolve_subs_from_name, names_to_resolve)
-        print(f"[LOG] resolved names to subs:  {name_to_subs}")
+        async with driver.session() as s:
+            name_to_subs = await s.execute_read(resolve_subs_from_name, names_to_resolve)
+        print(f"[LOG] resolved names to subs: {name_to_subs}")
+
+    # Step 3: assign subs_code และ clear cache
+    for it in payload.drug_histories + payload.drug_allergies:
+        if it.name in name_to_subs:
+            it.subs_code = name_to_subs[it.name]
+            item_code_cache.pop(id(it), None)  # ✅ refresh cache to reflect new subs_code
+
+    print(f"[LOG] names to resolve: {names_to_resolve}")
+    if names_to_resolve:
+        async with driver.session() as s:
+            name_to_subs = await s.execute_read(resolve_subs_from_name, names_to_resolve)
+        print(f"[LOG] resolved names to subs: {name_to_subs}")
         for it in payload.drug_histories + payload.drug_allergies:
             if it.name in name_to_subs:
                 it.subs_code = name_to_subs[it.name]
+                
 
-    # 2) Raw code‐sets (could be any level)
-    curr_codes    = {c for it in payload.drug_currents  for c in codes_from_item(it)}
-    hist_codes    = {c for it in payload.drug_histories for c in codes_from_item(it)}
-    allergy_codes = {c for it in payload.drug_allergies  for c in codes_from_item(it)}
-    print(f"[LOG] raw currents codes:     {sorted(curr_codes)}")
-    print(f"[LOG] raw histories codes:    {sorted(hist_codes)}")
-    print(f"[LOG] raw allergies codes:    {sorted(allergy_codes)}")
-
-    # 2.1) Resolve each raw code → all its SUBS IDs
-    with driver.session() as sess:
-        subs_curr_map    = sess.read_transaction(resolve_to_subs, list(curr_codes))
-        subs_hist_map    = sess.read_transaction(resolve_to_subs, list(hist_codes))
-        subs_allergy_map = sess.read_transaction(resolve_to_subs, list(allergy_codes))
-
-    print("[LOG] code → subs (currents):")
-    for code, lst in subs_curr_map.items():
-        print(f"   {code} → {lst!r}")
-    print("[LOG] code → subs (histories):")
-    for code, lst in subs_hist_map.items():
-        print(f"   {code} → {lst!r}")
-    print("[LOG] code → subs (allergies):")
-    for code, lst in subs_allergy_map.items():
-        print(f"   {code} → {lst!r}")
-
-    # flatten sets of resolved SUBS IDs
-    subs_curr_set    = {s for lst in subs_curr_map.values()    for s in lst}
-    subs_hist_set    = {s for lst in subs_hist_map.values()    for s in lst}
-    subs_allergy_set = {s for lst in subs_allergy_map.values() for s in lst}
-    print(f"[LOG] subs currents IDs:      {sorted(subs_curr_set)}")
-    print(f"[LOG] subs histories IDs:     {sorted(subs_hist_set)}")
-    print(f"[LOG] subs allergies IDs:     {sorted(subs_allergy_set)}")
-
-    # 3) Enrich details for all raw codes
+    # Collect all codes
+    all_items = payload.drug_currents + payload.drug_histories + payload.drug_allergies
+    curr_codes = {code for it in payload.drug_currents for code in await get_cached_codes(it)}
+    hist_codes = {code for it in payload.drug_histories for code in await get_cached_codes(it)}
+    allergy_codes = {code for it in payload.drug_allergies for code in await get_cached_codes(it)}
     all_codes = curr_codes | hist_codes | allergy_codes
-    with driver.session() as s:
-        detail_map = s.read_transaction(query_drug_details, list(all_codes))
-    current_map = enrich_items(payload.drug_currents,  detail_map)
-    history_map = enrich_items(payload.drug_histories, detail_map)
-    allergy_map = enrich_items(payload.drug_allergies, detail_map)
 
-    # 4) Build full AllergyItem list by SUBS ID
+    print(f"[LOG] raw currents codes: {sorted(curr_codes)}")
+    print(f"[LOG] raw histories codes: {sorted(hist_codes)}")
+    print(f"[LOG] raw allergies codes: {sorted(allergy_codes)}")
+
+    # Run Neo4j queries in parallel
+    async with driver.session() as sess1, driver.session() as sess2:
+        subs_map, detail_map = await asyncio.gather(
+            sess1.execute_read(resolve_to_subs, list(all_codes)),
+            sess2.execute_read(query_drug_details, list(all_codes))
+        )
+
+
+    # Separate subs
+    subs_curr_set = {s for c in curr_codes for s in subs_map.get(c, [])}
+    subs_hist_set = {s for c in hist_codes for s in subs_map.get(c, [])}
+    subs_allergy_set = {s for c in allergy_codes for s in subs_map.get(c, [])}
+
+    print(f"[LOG] subs currents IDs: {sorted(subs_curr_set)}")
+    print(f"[LOG] subs histories IDs: {sorted(subs_hist_set)}")
+    print(f"[LOG] subs allergies IDs: {sorted(subs_allergy_set)}")
+
+    # Enrich
+    current_map = await enrich_items(driver, payload.drug_currents, detail_map)
+    history_map = await enrich_items(driver, payload.drug_histories, detail_map)
+    allergy_map = await enrich_items(driver, payload.drug_allergies, detail_map)
+
+    # Build response
     allergy_rows: List[AllergyItem] = []
-    all_subs_ids = set(current_map) | set(history_map)
-    for subs_id in sorted(all_subs_ids):
-        itm = current_map.get(subs_id) or history_map.get(subs_id)
-        data = fill_codes("input", itm)
+    combined_map = {**current_map, **history_map}
+    for subs_id, itm_list in combined_map.items():
+        if not isinstance(itm_list, list):
+            itm_list = [itm_list]
+        for itm in itm_list:
+            data = await fill_codes("input", itm)
+            in_curr = subs_id in subs_curr_set
+            in_hist = subs_id in subs_hist_set
+            is_allergy = subs_id in subs_allergy_set
+            data["is_allergy"] = is_allergy
+            data["allergy_type"] = 2 if (in_curr and in_hist) else (0 if in_curr else 1)
+            allergy_rows.append(AllergyItem(**data))
 
-        in_curr    = subs_id in subs_curr_set
-        in_hist    = subs_id in subs_hist_set
-        is_allergy = subs_id in subs_allergy_set
 
-        data["is_allergy"]   = is_allergy
-        data["allergy_type"] = 2 if (in_curr and in_hist) else (0 if in_curr else 1)
+    print(f"[LOG] allergy summary rows: {len(allergy_rows)} items")
+    allergy_rows = [row for row in allergy_rows if row.is_allergy]
+    print(f"[LOG] filtered allergy rows (only True): {len(allergy_rows)} items")
 
-        allergy_rows.append(AllergyItem(**data))
-
-    print(f"[LOG] allergy summary rows:   {len(allergy_rows)} items")
-
-    # 5) Paginate
+    # Paginate
     total = len(allergy_rows)
     start = (page - 1) * row
-    end   = start + row
+    end = start + row
     page_rows = allergy_rows[start:end]
 
     return AllergyResponse(
         status=True,
         code=200,
         message="get success",
-        data_allergy=PageResponse(
+        data=PageResponse(
             pagination=Pagination(page=page, row=len(page_rows), total=total),
             data=page_rows
         )
