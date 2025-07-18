@@ -121,6 +121,7 @@ class AllergyItem(BaseModel):
     allergy_type:      int    = Field(
         ..., ge=0, le=2, description="0=current only, 1=history only, 2=both"
     )
+    allergy_substances: List[Dict[str, str]] 
 
 
 class DrugsResponse(BaseModel):
@@ -148,7 +149,7 @@ WITH q, node, score,
     WHEN node.`TMTID(GP)`  = q OR toLower(node.`GPNAME`)  CONTAINS toLower(q) THEN "GP"
     WHEN node.`TMTID(VTM)` = q OR toLower(node.`VTMNAME`) CONTAINS toLower(q) THEN "VTM"
     WHEN node.`TMTID(SUBS)_LIST` CONTAINS q
-         OR toLower(node.`SUBSNAME_LIST`) CONTAINS toLower(q)              THEN "SUBS"
+         OR toLower(node.`SUBSNAME_LIST`) CONTAINS toLower(q) THEN "SUBS"
     ELSE "UNKNOWN"
   END AS level
 WITH *
@@ -631,22 +632,52 @@ RETURN code AS raw_code, subs_ids
     current_map = await enrich_items(driver, payload.drug_currents, detail_map)
     history_map = await enrich_items(driver, payload.drug_histories, detail_map)
     allergy_map = await enrich_items(driver, payload.drug_allergies, detail_map)
+    
+    
+   # 1) fetch the SUBSNAME map once
+    SUBS_NAME_CYPHER = """
+    UNWIND $subs_ids AS sid
+    MATCH (s:SUBS {`TMTID(SUBS)`: sid})
+    RETURN sid AS code, s.SUBSNAME AS name
+    """
+    async with driver.session() as sess:
+        result = await sess.run(SUBS_NAME_CYPHER, {"subs_ids": list(subs_allergy_set)})
+        subs_name_map = {record["code"]: record["name"] async for record in result}
 
-    # Build response
+    # 2) Build response
     allergy_rows: List[AllergyItem] = []
     combined_map = {**current_map, **history_map}
-    for subs_id, itm_list in combined_map.items():
-        if not isinstance(itm_list, list):
-            itm_list = [itm_list]
-        for itm in itm_list:
-            data = await fill_codes("input", itm)
-            in_curr = subs_id in subs_curr_set
-            in_hist = subs_id in subs_hist_set
-            is_allergy = subs_id in subs_allergy_set
-            data["is_allergy"] = is_allergy
-            data["allergy_type"] = 2 if (in_curr and in_hist) else (0 if in_curr else 1)
-            allergy_rows.append(AllergyItem(**data))
 
+    # Use an ordered dict to preserve insertion order, keyed by the object id of itm
+    from collections import OrderedDict
+    grouped: "OrderedDict[int, dict]" = OrderedDict()
+
+    for subs_id, itm_list in combined_map.items():
+        # only care about true allergies
+        if subs_id not in subs_allergy_set:
+            continue
+
+        for itm in (itm_list if isinstance(itm_list, list) else [itm_list]):
+            key = id(itm)
+
+            # if first time seeing this itm, initialize its data
+            if key not in grouped:
+                data = await fill_codes("input", itm)
+                in_curr = key in {id(x) for x in payload.drug_currents}
+                in_hist = key in {id(x) for x in payload.drug_histories}
+                data["is_allergy"]   = True
+                data["allergy_type"] = 2 if (in_curr and in_hist) else (0 if in_curr else 1)
+                data["allergy_substances"] = []
+                grouped[key] = data
+
+            # append this subs to its allergy_substances
+            grouped[key]["allergy_substances"].append({
+                "code": subs_id,
+                "name": subs_name_map.get(subs_id, "")
+            })
+
+    # finally, build the list of AllergyItem from grouped values
+    allergy_rows = [AllergyItem(**vals) for vals in grouped.values()]
 
     print(f"[LOG] allergy summary rows: {len(allergy_rows)} items")
     allergy_rows = [row for row in allergy_rows if row.is_allergy]
