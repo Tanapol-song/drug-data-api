@@ -40,13 +40,21 @@ def normalize_query(text: str) -> str:
 async def codes_from_item(it: DrugItem) -> List[str]:
     """
     Extract all non-empty code attributes from a DrugItem.
+    Ensure returned list is flat and contains only strings.
     """
-    return [
-        c for c in [
-            it.tpu_code, it.tp_code, it.gpu_code,
-            it.gp_code, it.vtm_code, it.subs_code
-        ] if c
+    codes = [
+        it.tpu_code, it.tp_code, it.gpu_code,
+        it.gp_code, it.vtm_code, it.subs_code
     ]
+
+    # Handle case where subs_code might be a list from resolve_names
+    flattened: List[str] = []
+    for c in codes:
+        if isinstance(c, list):
+            flattened.extend([x for x in c if x])
+        elif isinstance(c, str) and c:
+            flattened.append(c)
+    return flattened
 
 async def highest_idx(it: DrugItem) -> int:
     """
