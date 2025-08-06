@@ -12,7 +12,8 @@ from utils.cypher import (
     SEARCHSUBS_CYPHER,
     CONTRAST_CYPHER,
     SUBS_NAME_CYPHER,
-    STRING_SEARCH_CYPHER
+    STRING_SEARCH_CYPHER,
+    STRING_SEARCH_EXTERNAL_CYPHER
 )
 from utils.helpers import normalize_query, sanitize_for_lucene
 
@@ -170,3 +171,23 @@ class Neo4jDrugRepository(DrugRepository):
                 name_map[record["code"]] = record["name"]
 
         return name_map
+    
+    async def fetch_external_flags(self, tpu_codes: List[str]) -> Dict[str, str]:
+        external_map: Dict[str, str] = {}
+
+        async with self.driver.session() as session:
+            for code in tpu_codes:
+                result = await session.run(STRING_SEARCH_EXTERNAL_CYPHER, {"q": code.lower()})
+            # เก็บ external ทุกค่าใน list
+                externals = []
+                async for record in result:
+                    val = record.get("external", "false")
+                    externals.append(str(val).strip().lower() == "true") 
+                    # externals.append(str(val).strip().lower())
+
+                # ถ้ามี 'true' อย่างน้อย 1 ตัว ให้เป็น 'true' ไม่งั้น 'false'
+                combined_external = any(externals)
+                # combined_external = "true" if "true" in externals else "false"
+                external_map[code] = combined_external
+
+        return external_map

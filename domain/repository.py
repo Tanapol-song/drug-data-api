@@ -30,3 +30,8 @@ class DrugRepository(ABC):
     async def fetch_subs_name_map(self, subs_ids: List[str]) -> Dict[str, str]:
         """Obtain human-readable SUBS names for a list of SUBS IDs."""
         ...
+
+    @abstractmethod
+    async def fetch_external_flags(self, tpu_codes: List[str]) -> Dict[str, str]:
+        """Return mapping of tpu_code to external flag (True/False)."""
+        ...

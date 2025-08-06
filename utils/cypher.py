@@ -97,3 +97,12 @@ UNWIND $subs_ids AS sid
 MATCH (s:SUBS {`TMTID(SUBS)`: sid})
 RETURN sid AS code, s.SUBSNAME AS name
 """
+
+# ── Fetch DRUG External ────────────────────────
+STRING_SEARCH_EXTERNAL_CYPHER = """
+UNWIND $q AS query
+MATCH (d:TPU)
+WHERE ANY(val IN [v IN keys(d) | toString(d[v])] 
+    WHERE toLower(val) CONTAINS toLower(query))
+RETURN d.external AS external
+"""

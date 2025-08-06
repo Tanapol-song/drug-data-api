@@ -47,9 +47,26 @@ class InteractionService:
         curr_codes = {c for it in payload.drug_currents  for c in await codes_from_item(it)}
         hist_codes = {c for it in payload.drug_histories for c in await codes_from_item(it)}
         all_codes  = list(curr_codes | hist_codes)
+        print("curr_codes",curr_codes)
+        print("hist_codes",hist_codes)
+        print("all_codes",all_codes)
+
+        #----------Fetch External----------------------------
+        # ✅ เตรียมดึง external flags สำหรับ allergy drugs
+        tpu_codes_cur = [it.tpu_code for it in payload.drug_currents if it.tpu_code]
+        tpu_codes_his = [it.tpu_code for it in payload.drug_histories if it.tpu_code]
+        all_tpu_codes = list(set(tpu_codes_cur + tpu_codes_his))
+        external_flags = await self.repo.fetch_external_flags(all_tpu_codes)
+        external_map = {str(code): flag for code, flag in external_flags.items()}
+
+        # ให้แน่ใจว่า tpu_code เป็น str ทั้งหมด
+        print("external_flags:", external_flags)
+        print("external_map:", external_map)
 
         # 3) Fetch detailed drug info (including SUBS mappings)
         detail_map: Dict[str, dict] = await self.repo.query_details(all_codes)
+        # print("detail_map :",detail_map)
+
 
         # ── ENRICH each DrugItem with full hierarchy codes & names ──
         # this mutates payload.drug_currents and payload.drug_histories in place
@@ -70,10 +87,61 @@ class InteractionService:
         # 5) Generate unique SUBS ID pairs
         unique_sids = sorted(subs_to_items.keys())
         pairs = [list(p) for p in combinations(unique_sids, 2)]
+        print("unique_sids :",unique_sids)
+        print("pairs :",pairs)
+
+        # 5.5) Filter out pairs that are True vs False external_flag
+        subs_external: Dict[str, bool] = {}
+        for tpu_code, detail in detail_map.items():
+            external = external_map.get(tpu_code, False)
+            for subs_code in detail.get("subs_codes", []):
+                if subs_code in subs_external:
+                    subs_external[subs_code] = subs_external[subs_code] or external
+                else:
+                    subs_external[subs_code] = external
+
+            # -- 1) ถ้า external ของทุก subs เป็น True → ไม่ต้องแสดงอะไรเลย
+        if all(subs_external.get(sid, False) for sid in unique_sids):
+            valid_pairs = []
+            print("🟡 Skipping: all substances are external=True")
+
+        # -- 2 & 3) ต้องกรองตามเงื่อนไขที่เหลือ
+        else:
+            valid_pairs = []
+            mixed_pairs = []
+            for sid1, sid2 in pairs:
+                ext1 = subs_external.get(sid1, False)
+                ext2 = subs_external.get(sid2, False)
+                
+                # เงื่อนไขที่ 2: ทั้งคู่ False → เก็บไว้ก่อน (ต้องเช็คว่ามี contrast จริงทีหลัง)
+                if not ext1 and not ext2:
+                    valid_pairs.append([sid1, sid2])
+
+                # เงื่อนไขที่ 3: มีคู่ True กับ False → เก็บไว้ตรวจ contrast ทีหลัง
+                elif (ext1 and not ext2) or (not ext1 and ext2):
+                    mixed_pairs.append([sid1, sid2])
+
+            print("✅ valid_pairs (False vs False):", valid_pairs)
+            print("⛔ mixed_pairs (True vs False):", mixed_pairs)
+
+            # ดึงข้อมูล contrast ของ mixed_pairs เพื่อตัดออก
+            if mixed_pairs:
+                mixed_records = await self.repo.fetch_contrasts(mixed_pairs)
+                mixed_contrasts = {(r["sub1_id"], r["sub2_id"]) for r in mixed_records}
+                mixed_contrasts |= {(b, a) for a, b in mixed_contrasts}  # ทำให้หาได้แบบไม่เรียง
+
+                for sid1, sid2 in mixed_pairs:
+                    if (sid1, sid2) in mixed_contrasts:
+                        print(f"❌ Skipped mixed pair (contrast found): {sid1} vs {sid2}")
+                        continue  # ตัดออก
+                    else:
+                        print(f"✅ Kept mixed pair (no contrast): {sid1} vs {sid2}")
+                        valid_pairs.append([sid1, sid2])
 
         # 6) Fetch raw contrast records
-        raw_records = await self.repo.fetch_contrasts(pairs)
+        raw_records = await self.repo.fetch_contrasts(valid_pairs)
         pair_to_data = { (r["sub1_id"], r["sub2_id"]): r for r in raw_records }
+        print("pair_to_data :",pair_to_data)
 
         # 7) Assemble ContrastItem rows
         rows: List[ContrastItem] = []
