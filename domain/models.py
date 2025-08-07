@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 T = TypeVar("T")
 
 class DrugItem(BaseModel):
+    source: Optional[str] = None
     tpu_code:  Optional[str] = ""
     tp_code:   Optional[str] = ""
     gpu_code:  Optional[str] = ""

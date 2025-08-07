@@ -47,12 +47,8 @@ class InteractionService:
         curr_codes = {c for it in payload.drug_currents  for c in await codes_from_item(it)}
         hist_codes = {c for it in payload.drug_histories for c in await codes_from_item(it)}
         all_codes  = list(curr_codes | hist_codes)
-        print("curr_codes",curr_codes)
-        print("hist_codes",hist_codes)
-        print("all_codes",all_codes)
 
-        #----------Fetch External----------------------------
-        # ✅ เตรียมดึง external flags สำหรับ allergy drugs
+        # 2.1) เตรียมดึง external flags สำหรับ allergy drugs
         tpu_codes_cur = [it.tpu_code for it in payload.drug_currents if it.tpu_code]
         tpu_codes_his = [it.tpu_code for it in payload.drug_histories if it.tpu_code]
         all_tpu_codes = list(set(tpu_codes_cur + tpu_codes_his))
@@ -60,7 +56,6 @@ class InteractionService:
         external_map = {str(code): flag for code, flag in external_flags.items()}
 
         # ให้แน่ใจว่า tpu_code เป็น str ทั้งหมด
-        print("external_flags:", external_flags)
         print("external_map:", external_map)
 
         # 3) Fetch detailed drug info (including SUBS mappings)
@@ -73,6 +68,12 @@ class InteractionService:
         await enrich_items(self.repo.driver, payload.drug_currents, detail_map)
         await enrich_items(self.repo.driver, payload.drug_histories, detail_map)
 
+        # 🟢 Mark source for each DrugItem
+        for itm in payload.drug_currents:
+            itm.source = "current"
+        for itm in payload.drug_histories:
+            itm.source = "history"
+        
         # 4) Build mapping from SUBS ID to DrugItem
         subs_to_items: Dict[str, List[DrugItem]] = {}
         for group in (payload.drug_currents, payload.drug_histories):
@@ -81,8 +82,10 @@ class InteractionService:
                     entry = detail_map.get(code)
                     if entry and entry.get("subs_codes"):
                         for sid in entry["subs_codes"]:
-                            subs_to_items.setdefault(sid, []).append(itm)
+                             if itm not in subs_to_items.get(sid, []):
+                                subs_to_items.setdefault(sid, []).append(itm)
                         break
+
 
         # 5) Generate unique SUBS ID pairs
         unique_sids = sorted(subs_to_items.keys())
@@ -100,7 +103,7 @@ class InteractionService:
                 else:
                     subs_external[subs_code] = external
 
-            # -- 1) ถ้า external ของทุก subs เป็น True → ไม่ต้องแสดงอะไรเลย
+        # -- 1) ถ้า external ของทุก subs เป็น True → ไม่ต้องแสดงอะไรเลย
         if all(subs_external.get(sid, False) for sid in unique_sids):
             valid_pairs = []
             print("🟡 Skipping: all substances are external=True")
@@ -133,7 +136,7 @@ class InteractionService:
                 for sid1, sid2 in mixed_pairs:
                     if (sid1, sid2) in mixed_contrasts:
                         print(f"❌ Skipped mixed pair (contrast found): {sid1} vs {sid2}")
-                        continue  # ตัดออก
+                        continue
                     else:
                         print(f"✅ Kept mixed pair (no contrast): {sid1} vs {sid2}")
                         valid_pairs.append([sid1, sid2])
@@ -141,17 +144,34 @@ class InteractionService:
         # 6) Fetch raw contrast records
         raw_records = await self.repo.fetch_contrasts(valid_pairs)
         pair_to_data = { (r["sub1_id"], r["sub2_id"]): r for r in raw_records }
-        print("pair_to_data :",pair_to_data)
+        # print("pair_to_data :",pair_to_data)
 
+
+        # print("pairs :",pairs)
         # 7) Assemble ContrastItem rows
+        seen_pairs_with_items = set()
         rows: List[ContrastItem] = []
         for sid1, sid2 in pairs:
+            items1 = subs_to_items.get(sid1, [])
+            items2 = subs_to_items.get(sid2, [])
+            # print("items2 :",items2)
+            if all(it.source == "history" for it in items1) and all(it.source == "history" for it in items2):
+                print(f"Skipping pair only in history: {sid1} vs {sid2}")
+                continue
+            
             rec = pair_to_data.get((sid1, sid2)) or pair_to_data.get((sid2, sid1))
             if not rec:
                 continue
 
             for in_item in subs_to_items.get(sid1, []):
                 for ct_item in subs_to_items.get(sid2, []):
+                    pair_key = tuple(sorted([sid1, sid2]))
+                    item_key = tuple(sorted([in_item.tpu_code or "", ct_item.tpu_code or ""]))
+                    combined_key = (pair_key, item_key)
+
+                    if combined_key in seen_pairs_with_items:
+                        continue
+                    seen_pairs_with_items.add(combined_key)
                     input_fields    = await fill_codes("input", in_item)
                     contrast_fields = await fill_codes("contrast", ct_item)
 
