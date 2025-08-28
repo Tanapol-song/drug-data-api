@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from dotenv import load_dotenv
 
 from api.routers.drugs import router as drugs_router
+from api.routers.search import router as search_router
 from api.routers.allergy import router as allergy_router
 
 # Load environment variables (so routers can pick them up if needed)
@@ -18,6 +19,7 @@ app = FastAPI(
 # Mount our two routers
 app.include_router(drugs_router)
 app.include_router(allergy_router)
+app.include_router(search_router)
 
 if __name__ == "__main__":
     import uvicorn

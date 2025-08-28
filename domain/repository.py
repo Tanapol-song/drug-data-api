@@ -1,7 +1,8 @@
 # File: domain/repository.py
 
 from abc import ABC, abstractmethod
-from typing import List, Dict
+from typing import List, Dict, Any
+
 
 class DrugRepository(ABC):
     """Port interface for drug-related data operations."""
@@ -34,4 +35,29 @@ class DrugRepository(ABC):
     @abstractmethod
     async def fetch_external_flags(self, tpu_codes: List[str]) -> Dict[str, str]:
         """Return mapping of tpu_code to external flag (True/False)."""
+        ...
+
+    @abstractmethod
+    async def get_all_tpu_data(self) -> list[dict]: ...
+
+    @abstractmethod
+    async def get_limit_tpu_data(self, limit: int) -> list[dict]: ...
+
+
+class ElasticDrugRepository(ABC):
+    # @abstractmethod
+    # async def get_embedding(self, text: str) -> Any:
+    #     """Return embedding vector for the given text."""
+    #     ...
+
+    @abstractmethod
+    async def check_exists_by_tpu(self, tpu_name: str) -> bool:
+        """Check if TPU exists in Elasticsearch by TPU name"""
+        ...
+
+    @abstractmethod
+    async def insert_embedding(
+        self, tpu_name: str, embedding: list[float], tpu_code: str | None = None
+    ):
+        """Insert new TPU embedding into Elasticsearch"""
         ...

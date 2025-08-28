@@ -13,9 +13,10 @@ from utils.cypher import (
     CONTRAST_CYPHER,
     SUBS_NAME_CYPHER,
     STRING_SEARCH_CYPHER,
-    STRING_SEARCH_EXTERNAL_CYPHER
+    STRING_SEARCH_EXTERNAL_CYPHER,
 )
 from utils.helpers import normalize_query, sanitize_for_lucene
+
 
 class Neo4jDrugRepository(DrugRepository):
     """Neo4j adapter implementing the DrugRepository interface."""
@@ -26,7 +27,7 @@ class Neo4jDrugRepository(DrugRepository):
     async def resolve_names(self, names: List[str]) -> Dict[str, List[str]]:
         name_map: Dict[str, List[str]] = {}
         unresolved = set(names)
-    
+
         async with self.driver.session() as session:
             # Step 1: Try STRING_SEARCH_CYPHER
             for name in list(unresolved):
@@ -41,16 +42,21 @@ class Neo4jDrugRepository(DrugRepository):
                         except:
                             subs_codes = []
                     if subs_codes:
-                        name_map[name] = list(sorted(set(subs_codes)))  # remove duplicates
+                        name_map[name] = list(
+                            sorted(set(subs_codes))
+                        )  # remove duplicates
                         unresolved.discard(name)
-    
+
             # Step 2: Fallback to DRUGSEARCH_CYPHER
             if unresolved:
-                sanitized_qs = [sanitize_for_lucene(normalize_query(name)) for name in unresolved]
+                sanitized_qs = [
+                    sanitize_for_lucene(normalize_query(name)) for name in unresolved
+                ]
                 query_to_name = {
-                    sanitize_for_lucene(normalize_query(name)): name for name in unresolved
+                    sanitize_for_lucene(normalize_query(name)): name
+                    for name in unresolved
                 }
-    
+
                 result = await session.run(DRUGSEARCH_CYPHER, {"qs": sanitized_qs})
                 async for record in result:
                     q = record["code"]
@@ -66,9 +72,8 @@ class Neo4jDrugRepository(DrugRepository):
                     if subs_codes:
                         original_name = query_to_name.get(q, q)
                         name_map[original_name] = list(sorted(set(subs_codes)))
-    
-        return name_map
 
+        return name_map
 
     async def query_details(self, codes: List[str]) -> Dict[str, dict]:
         details: Dict[str, dict] = {}
@@ -111,8 +116,14 @@ class Neo4jDrugRepository(DrugRepository):
                         details[sid] = {
                             "subs_codes": [sid],
                             "subs_names": [],
-                            **{f"{lvl}_code": "" for lvl in ["tpu", "tp", "gpu", "gp", "vtm"]},
-                            **{f"{lvl}_name": "" for lvl in ["tpu", "tp", "gpu", "gp", "vtm"]},
+                            **{
+                                f"{lvl}_code": ""
+                                for lvl in ["tpu", "tp", "gpu", "gp", "vtm"]
+                            },
+                            **{
+                                f"{lvl}_name": ""
+                                for lvl in ["tpu", "tp", "gpu", "gp", "vtm"]
+                            },
                         }
 
         return details
@@ -171,18 +182,20 @@ class Neo4jDrugRepository(DrugRepository):
                 name_map[record["code"]] = record["name"]
 
         return name_map
-    
+
     async def fetch_external_flags(self, tpu_codes: List[str]) -> Dict[str, str]:
         external_map: Dict[str, str] = {}
 
         async with self.driver.session() as session:
             for code in tpu_codes:
-                result = await session.run(STRING_SEARCH_EXTERNAL_CYPHER, {"q": code.lower()})
-            # เก็บ external ทุกค่าใน list
+                result = await session.run(
+                    STRING_SEARCH_EXTERNAL_CYPHER, {"q": code.lower()}
+                )
+                # เก็บ external ทุกค่าใน list
                 externals = []
                 async for record in result:
                     val = record.get("external", "false")
-                    externals.append(str(val).strip().lower() == "true") 
+                    externals.append(str(val).strip().lower() == "true")
                     # externals.append(str(val).strip().lower())
 
                 # ถ้ามี 'true' อย่างน้อย 1 ตัว ให้เป็น 'true' ไม่งั้น 'false'
@@ -191,3 +204,63 @@ class Neo4jDrugRepository(DrugRepository):
                 external_map[code] = combined_external
 
         return external_map
+
+    # async def get_all_tpu_data(self) -> list[dict]:
+    #     query = """
+    #     MATCH (t:TPU)
+    #     WHERE exists(t.name) AND exists(t.tmt_id)
+    #     RETURN id(t) AS id, t.name AS TPUNAME, t.tmt_id AS TMTID
+    #     ORDER BY t.name
+    #     """
+
+    #     async with self.driver.session() as session:
+    #         result = await session.run(query)
+    #         records = await result.values()
+
+    #     return [
+    #         {"id": record["id"], "TPUNAME": record["TPUNAME"], "TMTID": record["TMTID"]}
+    #         for record in records
+    #     ]
+
+    async def get_all_tpu_data(self) -> list[dict]:
+        query = """      
+        MATCH (t:TPU)
+        WHERE t.TPUNAME IS NOT NULL AND t.`TMTID(TPU)` IS NOT NULL
+        RETURN id(t) AS id, t.TPUNAME AS TPUNAME, t.`TMTID(TPU)` AS TMTID
+        ORDER BY t.TPUNAME
+        """
+
+        async with self.driver.session() as session:
+            result = await session.run(query)
+            records = await result.values()
+
+        return [
+            {
+                "id": r[0],
+                "TPUNAME": r[1],
+                "TMTID": r[2],
+            }
+            for r in records
+        ]
+
+    async def get_limit_tpu_data(self, limit: int) -> list[dict]:
+        query = f"""
+        MATCH (t:TPU)
+        WHERE t.TPUNAME IS NOT NULL AND t.`TMTID(TPU)` IS NOT NULL
+        RETURN id(t) AS id, t.TPUNAME AS TPUNAME, t.`TMTID(TPU)` AS TMTID
+        ORDER BY t.TPUNAME
+        LIMIT {limit}
+        """
+
+        async with self.driver.session() as session:
+            result = await session.run(query)
+            records = await result.values()
+
+        return [
+            {
+                "id": r[0],
+                "TPUNAME": r[1],
+                "TMTID": r[2],
+            }
+            for r in records
+        ]

@@ -96,6 +96,15 @@ class AllergyItem(BaseModel):
     )
     allergy_substances: List[Dict[str, str]]
 
+class DrugsLocal(BaseModel):
+    name:      Optional[str] = ""
+    tpu_code:  Optional[str] = ""
+    tp_code:   Optional[str] = ""
+    gpu_code:  Optional[str] = ""
+    gp_code:   Optional[str] = ""
+    vtm_code:  Optional[str] = ""
+    subs_code: Optional[str] = ""
+
 class DrugsResponse(BaseModel):
     status:  bool
     code:    int
@@ -107,3 +116,21 @@ class AllergyResponse(BaseModel):
     code:    int
     message: str
     data:    PageResponse[AllergyItem]
+
+# Request body model
+class DrugSearchPayload(BaseModel):
+    names: List[str]
+
+class DrugDetail(BaseModel):
+    tpu_code: Optional[str]
+    tpu_name: Optional[str]
+    tp_code: Optional[str]
+    tp_name: Optional[str]
+    gpu_code: Optional[str]
+    gpu_name: Optional[str]
+    gp_code: Optional[str]
+    gp_name: Optional[str]
+    vtm_code: Optional[str]
+    vtm_name: Optional[str]
+class DrugSearchResponse(BaseModel):
+    result: Dict[str, List[DrugDetail]]
