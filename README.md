@@ -1,4 +1,1 @@
-# --- Staging ---
-NEO4J_URI_STAGING=neo4j://stg-drug-neo4j.manageai.co.th:37687
-NEO4J_USERNAME_STAGING=neo4j
-NEO4J_PASSWORD_STAGING=qn3qz7jB0GIE3PZWSjWnoibUy4DP8ue8
+
