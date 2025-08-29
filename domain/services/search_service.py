@@ -1,6 +1,8 @@
 import aiohttp
 import asyncio
 import logging
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 
 from typing import Dict, List, Any, Tuple, Optional
 from infrastructure.elastic_repository import ElasticDrugRepository
@@ -37,6 +39,13 @@ class SearchService:
             ) as resp:
                 data = await resp.json()
                 return data
+
+    async def match_vector(self, text: str):
+        vector = await self.get_embedding(text=text)
+        first_vector = vector[0][0]
+        result = await self.elastic_repo.search_by_vector(query_vector=first_vector)
+        print("fiest_vector :", first_vector[10])
+        return result
 
     async def embed_and_upsert_tpu_in_batches(
         self,
@@ -122,8 +131,8 @@ class SearchService:
 
                 tasks.append(asyncio.create_task(_guarded()))
 
-                if tasks:
-                    await asyncio.gather(*tasks)
+        if tasks:
+            await asyncio.gather(*tasks)
 
         logging.info("✅ เสร็จสิ้นการทำงานทั้งหมด")
         return {

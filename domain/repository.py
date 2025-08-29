@@ -61,3 +61,8 @@ class ElasticDrugRepository(ABC):
     ):
         """Insert new TPU embedding into Elasticsearch"""
         ...
+        
+    @abstractmethod
+    async def search_by_vector(self, query_vector: List[float], k: int = 10):
+        """Vector Search in Elasticsearch by TPU name """
+        ...

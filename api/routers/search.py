@@ -1,7 +1,7 @@
 import os
 from fastapi import APIRouter, Depends, Query, Body
 from neo4j import basic_auth, AsyncGraphDatabase
-from elasticsearch import AsyncElasticsearch
+from elasticsearch import AsyncElasticsearch, Elasticsearch
 from dotenv import load_dotenv
 
 from domain.models import (
@@ -36,6 +36,7 @@ router = APIRouter(prefix="/api/v1")
 
 # es_client = AsyncElasticsearch(ELASTIC_URL, basic_auth=(ELASTIC_USER, ELASTIC_PASS))
 es_client = AsyncElasticsearch(ELASTIC_URL, api_key=ELASTIC_API_KEY)
+# es_client = Elasticsearch(ELASTIC_URL, api_key=ELASTIC_API_KEY)
 
 
 driver = AsyncGraphDatabase.driver(
@@ -58,14 +59,26 @@ def get_search_service() -> SearchService:
     )
 
 
-@router.post("/search-elastic")
+@router.post("/embedding-check")
 async def search_drugs_elastic(
     payload: DrugSearchPayload, service: SearchService = Depends(get_search_service)
 ):
     embeddings = await service.get_embedding(payload.names[0])  # ตัวอย่าง
     return {
-        "debug_payload": payload.dict(),  # ข้อมูลที่ client ส่งมา
-        "embeddings": embeddings,  # response จาก embedding API
+        "debug_payload": payload.dict(),
+        "embeddings": embeddings,
+    }
+
+
+@router.post("/search-elastic-vector")
+async def search_drugs_elastic(
+    payload: DrugSearchPayload, service: SearchService = Depends(get_search_service)
+):
+    result = await service.match_vector(payload.names[0])
+    print("name :", payload.names[0])
+    return {
+        "debug_payload": payload.dict(),
+        "matching": result,
     }
 
 
@@ -75,15 +88,15 @@ async def get_tpu_list(service: SearchService = Depends(get_search_service)):
     return {"total": len(data), "items": data}
 
 
-@router.post("/tpu-sync-batch")
+@router.post("tpu-embedding")
 async def tpu_sync_batch(
     service: SearchService = Depends(get_search_service),
 ):
     out = await service.embed_and_upsert_tpu_in_batches(
-        batch_size=100,  # จำนวนต่อ batch
-        concurrency=10,  # จำนวน concurrent task ต่อ batch
-        delay_sec=0.05,  # ใส่ได้ถ้าอยาก throttle
-        skip_if_exists=True,  # true = ถ้ามี doc id นี้แล้วให้ข้าม
-        # start_after_idx=0 # ใช้ resume ถ้าต้องการ
+        batch_size=100,
+        concurrency=10,
+        delay_sec=0.05,
+        skip_if_exists=True,
+        # start_after_idx=0
     )
     return out

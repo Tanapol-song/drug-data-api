@@ -1,8 +1,6 @@
+from typing import List
 from elasticsearch import AsyncElasticsearch
 from domain.repository import ElasticDrugRepository
-from dotenv import load_dotenv
-import aiohttp
-import os
 
 
 class ElasticDrugRepository(ElasticDrugRepository):
@@ -34,7 +32,6 @@ class ElasticDrugRepository(ElasticDrugRepository):
         )
 
     async def exists_by_id(self, doc_id: str) -> bool:
-        # elasticsearch-py v8 returns bool already
         return bool(await self.client.exists(index=self.index_name, id=doc_id))
 
     async def check_exists_by_tpu(self, tpu_name: str) -> bool:
@@ -58,5 +55,36 @@ class ElasticDrugRepository(ElasticDrugRepository):
             "tpu_codes": tpu_code,
             "embedding": embedding,
         }
-        print("✅insert_embedding by id :", id)
-        await self.client.index(index=self.index_name, id=id, document=doc)
+        print("✅insert_embedding by id :", tpu_code)
+        await self.client.index(index=self.index_name, document=doc)
+
+    async def search_by_vector_knn(self, query_vector: List[float], k: int = 10):
+        body = {
+            "field": "embedding",
+            "query_vector": query_vector,
+            "k": k,
+            "num_candidates": 500,
+        }
+
+        response = await self.client.search(
+            index=self.index_name, knn=body, source=(["name", "tpu_codes"])
+        )
+        return response["hits"]["hits"]
+
+    async def search_by_vector(self, query_vector: List[float], k: int = 10):
+        body = {
+            "size": k,
+            "query": {
+                "script_score": {
+                    "query": {"match_all": {}},
+                    "script": {
+                        "source": "cosineSimilarity(params.query_vector, 'embedding')",
+                        "params": {"query_vector": query_vector},
+                    },
+                }
+            },
+            "_source": ["name", "tpu_codes"],
+        }
+
+        response = await self.client.search(index=self.index_name, body=body)
+        return response["hits"]["hits"]
